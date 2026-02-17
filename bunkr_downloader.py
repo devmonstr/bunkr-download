@@ -34,6 +34,10 @@ class RetryableHTTPError(Exception):
     pass
 
 
+class DeadLinkError(Exception):
+    pass
+
+
 @dataclass
 class FileJob:
     slug: str
@@ -304,6 +308,49 @@ class DownloadArchive:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(slug + "\n")
             self.seen.add(slug)
+
+
+class FailedLinkLogger:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.header_written = path.exists() and path.stat().st_size > 0
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe(value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+    def add(
+        self,
+        target_url: str,
+        slug: str,
+        filename: str,
+        reason: str,
+        resolved_url: Optional[str],
+        file_page_url: Optional[str],
+    ) -> None:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        fields = [
+            ts,
+            self._safe(target_url),
+            self._safe(slug),
+            self._safe(filename),
+            self._safe(reason),
+            self._safe(resolved_url),
+            self._safe(file_page_url),
+        ]
+        line = "\t".join(fields) + "\n"
+        with self.lock:
+            with self.path.open("a", encoding="utf-8") as f:
+                if not self.header_written:
+                    f.write(
+                        "timestamp\ttarget_url\tslug\tfilename\treason\tresolved_url\tfile_page_url\n"
+                    )
+                    self.header_written = True
+                f.write(line)
 
 
 def clean_filename(name: str, fallback: str) -> str:
@@ -639,6 +686,9 @@ def download_file(
     retries: int,
     ui: TerminalUI,
     label: str,
+    referer: Optional[str] = None,
+    origin: Optional[str] = None,
+    skip_dead: bool = False,
 ) -> str:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists() and skip_existing:
@@ -655,7 +705,11 @@ def download_file(
 
     while True:
         current_size = tmp_path.stat().st_size if tmp_path.exists() else 0
-        headers = {}
+        headers: dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        if origin:
+            headers["Origin"] = origin
         if current_size > 0:
             headers["Range"] = f"bytes={current_size}-"
 
@@ -663,6 +717,8 @@ def download_file(
             with session.get(url, headers=headers, stream=True, timeout=(15, timeout)) as r:
                 if r.status_code in RETRY_HTTP_STATUS:
                     raise RetryableHTTPError(f"Retryable HTTP status: {r.status_code}")
+                if skip_dead and r.status_code == 404:
+                    raise DeadLinkError(f"404 Not Found: {r.url}")
 
                 if current_size > 0 and r.status_code == 200:
                     # Server ignored Range; restart full download.
@@ -738,6 +794,9 @@ def download_file(
                 ui.finish_progress_line()
                 ui.complete_task(label, True, f"{label} saved -> {out_path.name}")
                 return "downloaded"
+        except DeadLinkError:
+            ui.finish_progress_line()
+            raise
         except (requests.RequestException, RetryableHTTPError) as exc:
             if attempt >= retries:
                 ui.finish_progress_line()
@@ -862,11 +921,14 @@ def worker(
     job: FileJob,
     out_dir: Path,
     target_prefix: str,
+    target_url: str,
     dry_run: bool,
     skip_existing: bool,
     timeout: int,
     retries: int,
     archive: Optional[DownloadArchive],
+    failed_logger: Optional[FailedLinkLogger],
+    skip_dead: bool,
 ) -> str:
     session = sessions.get()
     prefix = f"{target_prefix} " if target_prefix else ""
@@ -881,6 +943,15 @@ def worker(
         retries=retries,
     )
     if not direct_url:
+        if failed_logger:
+            failed_logger.add(
+                target_url=target_url,
+                slug=job.slug,
+                filename=raw_name or job.slug,
+                reason="cannot resolve file URL",
+                resolved_url=None,
+                file_page_url=job.page_url,
+            )
         ui.complete_task(label, False, f"{label} cannot resolve file URL")
         return "failed"
 
@@ -910,11 +981,35 @@ def worker(
             retries=retries,
             ui=ui,
             label=label,
+            referer=job.page_url,
+            origin=origin,
+            skip_dead=skip_dead,
         )
         if archive and status in {"downloaded", "skipped"}:
             archive.add(job.slug)
         return status
+    except DeadLinkError as exc:
+        if failed_logger:
+            failed_logger.add(
+                target_url=target_url,
+                slug=job.slug,
+                filename=safe_name,
+                reason=str(exc),
+                resolved_url=direct_url,
+                file_page_url=job.page_url,
+            )
+        ui.complete_task(label, False, f"{label} {exc}")
+        return "failed"
     except Exception as exc:
+        if failed_logger:
+            failed_logger.add(
+                target_url=target_url,
+                slug=job.slug,
+                filename=safe_name,
+                reason=str(exc),
+                resolved_url=direct_url,
+                file_page_url=job.page_url,
+            )
         ui.complete_task(label, False, f"{label} {exc}")
         return "failed"
 
@@ -945,6 +1040,16 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Path to archive file (default: <output>/downloaded.txt)",
     )
+    parser.add_argument(
+        "--failed-file",
+        default="failed_links.txt",
+        help="Filename/path for failed links log (default: failed_links.txt in output root)",
+    )
+    parser.add_argument(
+        "--skip-dead",
+        action="store_true",
+        help="If final download response is 404, skip immediately without retries",
+    )
     parser.add_argument("--no-pretty", action="store_true", help="Disable pretty terminal output")
     return parser.parse_args()
 
@@ -960,6 +1065,7 @@ def run_target(
     skip_existing: bool,
     target_idx: int,
     target_total: int,
+    failed_logger: Optional[FailedLinkLogger],
 ) -> dict[str, int]:
     counts = {"downloaded": 0, "skipped": 0, "failed": 0, "resolved": 0}
     target_prefix = f"[LINK {target_idx}/{target_total}]" if target_total > 1 else ""
@@ -1020,11 +1126,14 @@ def run_target(
                 job=job,
                 out_dir=out_dir,
                 target_prefix=target_prefix,
+                target_url=target_url,
                 dry_run=args.dry_run,
                 skip_existing=skip_existing,
                 timeout=timeout,
                 retries=retries,
                 archive=archive,
+                failed_logger=failed_logger,
+                skip_dead=args.skip_dead,
             )
             counts[status] = counts.get(status, 0) + 1
     else:
@@ -1039,11 +1148,14 @@ def run_target(
                     job,
                     out_dir,
                     target_prefix,
+                    target_url,
                     args.dry_run,
                     skip_existing,
                     timeout,
                     retries,
                     archive,
+                    failed_logger,
+                    args.skip_dead,
                 )
                 for job in jobs
             ]
@@ -1072,9 +1184,15 @@ def main() -> int:
     workers = max(1, args.workers)
     retries = max(0, args.retries)
     timeout = max(10, args.timeout)
+    output_root = Path(args.output)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     ui = TerminalUI(pretty=not args.no_pretty, workers=workers)
     sessions = SessionFactory()
+    failed_path = Path(args.failed_file)
+    if not failed_path.is_absolute():
+        failed_path = output_root / failed_path
+    failed_logger = FailedLinkLogger(failed_path)
     overall = {"downloaded": 0, "skipped": 0, "failed": 0, "resolved": 0}
     multi_target = len(targets) > 1
     if input_is_file:
@@ -1094,6 +1212,7 @@ def main() -> int:
             skip_existing=skip_existing,
             target_idx=idx,
             target_total=len(targets),
+            failed_logger=failed_logger,
         )
         ui.finish_progress_line()
         summary_prefix = f"[LINK {idx}/{len(targets)}] " if multi_target else ""
@@ -1115,6 +1234,8 @@ def main() -> int:
             f"failed={overall.get('failed', 0)}, "
             f"resolved={overall.get('resolved', 0)}"
         )
+    if overall.get("failed", 0) > 0:
+        ui.info(f"Failed links saved to: {failed_path}")
     return 0 if overall.get("failed", 0) == 0 else 1
 
 

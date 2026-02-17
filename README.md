@@ -43,6 +43,15 @@ Run:
 python bunkr_downloader.py urls.txt
 ```
 
+If some files are dead/unavailable:
+
+```bash
+python bunkr_downloader.py urls.txt --skip-dead
+```
+
+Failed downloads are written to:
+- `downloads/failed_links.txt`
+
 Output:
 - Album URL: `downloads/<album_id>/...`
 - Example: `downloads/aaIQGCuR/your_file.mp4`
