@@ -1,6 +1,13 @@
 # Bunkr Downloader (Python)
 
 > Use only for files you have permission to download.
+> This project was written entirely with AI based on user instructions.
+
+## About
+
+- Python script for downloading files from Bunkr album/file links.
+- Supports single URL and `urls.txt` batch mode (1 link per line).
+- Code in this repository was generated using AI (OpenAI Codex).
 
 ## Install
 
