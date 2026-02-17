@@ -9,6 +9,13 @@
 - Supports single URL and `urls.txt` batch mode (1 link per line).
 - Code in this repository was generated using AI (OpenAI Codex).
 
+## Clone
+
+```bash
+git clone https://github.com/devmonstr/bunkr-download.git
+cd bunkr-download
+```
+
 ## Install
 
 ```bash
