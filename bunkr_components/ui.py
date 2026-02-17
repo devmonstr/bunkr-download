@@ -80,8 +80,11 @@ class TerminalUI:
         sys.stdout.flush()
 
     def _dashboard_assign_slot(self, key: str, title: str) -> None:
+        self._dashboard_ensure()
         if key in self.dashboard_key_to_slot:
             idx = self.dashboard_key_to_slot[key]
+            if idx >= len(self.dashboard_slots):
+                self.dashboard_slots.extend([""] * (idx - len(self.dashboard_slots) + 1))
             self.dashboard_slots[idx] = self._truncate(title)
             return
         used = set(self.dashboard_key_to_slot.values())
@@ -93,6 +96,8 @@ class TerminalUI:
         if idx is None:
             idx = 0
         self.dashboard_key_to_slot[key] = idx
+        if idx >= len(self.dashboard_slots):
+            self.dashboard_slots.extend([""] * (idx - len(self.dashboard_slots) + 1))
         self.dashboard_slots[idx] = self._truncate(title)
 
     def start_task(self, key: str, title: str) -> None:
@@ -107,6 +112,8 @@ class TerminalUI:
             if self.dashboard:
                 idx = self.dashboard_key_to_slot.pop(key, None)
                 if idx is not None:
+                    if idx >= len(self.dashboard_slots):
+                        self.dashboard_slots.extend([""] * (idx - len(self.dashboard_slots) + 1))
                     status = "DONE" if ok else "FAIL"
                     self.dashboard_slots[idx] = self._truncate(f"[{status}] {message}")
                     self._dashboard_render()
@@ -126,6 +133,11 @@ class TerminalUI:
     def _line(self, text: str) -> None:
         with self.lock:
             if self.dashboard:
+                # Before any task slot is allocated, print normal logs directly.
+                # This avoids cursor-control output swallowing early INFO/FAIL lines.
+                if not self.dashboard_slots:
+                    print(text, flush=True)
+                    return
                 self._dashboard_ensure()
                 sys.stdout.write(f"\033[{self.workers}A")
                 print(text, flush=True)
